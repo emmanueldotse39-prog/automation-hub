@@ -106,3 +106,224 @@ footer p{margin:0}
 <dialog id="machineDialog" aria-label="Machine details"></dialog>
 <dialog id="confirmDialog" aria-labelledby="confirmMsg"><p id="confirmMsg" style="margin:0 0 16px"></p><div class="row" style="justify-content:flex-end;margin:0"><button id="confirmCancel" class="btn" type="button">Cancel</button><button id="confirmOk" class="btn pri" type="button">Confirm</button></div></dialog>
 <noscript><p style="padding:16px">Automation Hub needs JavaScript enabled to run.</p></noscript>
+<script>
+"use strict";
+/* ===== Constants ===== */
+const TYPES=[["Auto Pocket Attach","APA"],["Zipper Attach","ZIP"],["Elastic Cutting","ELC"],["Back Moon Attach","BMA"],["Placket Attach","PLA"],["Welt Pocket Attach","WPA"],["Bottom Hem Auto","BHA"]];
+const CYC={APA:40,ZIP:35,ELC:12,BMA:45,PLA:38,WPA:55,BHA:30};
+const ST=["Running","Idle","Breakdown"];
+const COL={Running:"var(--run)",Idle:"var(--idle)",Breakdown:"var(--down)"};
+const FACTORIES=[1,2,3,4,5];
+const LS_KEY="automationHub.v1";
+/* ===== Utilities ===== */
+const $=s=>document.querySelector(s),app=$("#app");
+const esc=x=>String(x==null?"":x).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const escAttr=esc;
+let seed=7;const rnd=()=>{seed=(seed*16807)%2147483647;return seed/2147483647};
+const today=()=>new Date().toISOString().slice(0,10);
+const fmtDate=d=>{try{const x=new Date(d+"T00:00:00");return isNaN(x)?esc(d):x.toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}catch(e){return esc(d)}};
+function toast(msg,warn){const t=$("#toast");t.textContent=msg;t.classList.toggle("warn",!!warn);t.classList.add("show");clearTimeout(toast._h);toast._h=setTimeout(()=>t.classList.remove("show"),3000)}
+function confirmDialog(msg){return new Promise(res=>{const dg=$("#confirmDialog");$("#confirmMsg").textContent=msg;dg.showModal();$("#confirmOk").onclick=()=>{dg.close();res(true)};$("#confirmCancel").onclick=()=>{dg.close();res(false)};dg.onclose=()=>res(false)})}
+/* ===== State (single-versioned localStorage) ===== */
+function migrateLegacy(raw){
+ /* Migrates the old app's four keys (fh_machines4, fh_log4, fh_tot4, fh_plan) into one schema */
+ const legacy=[["fh_machines4","machines"],["fh_log4","log"],["fh_tot4","totals"]];
+ const out={schema:1,machines:[],log:[],totals:{},plan:480};
+ legacy.forEach(([k,dst])=>{try{const v=JSON.parse(localStorage.getItem(k)||"null");if(v)out[dst]=v}catch(e){}});
+ try{const p=+localStorage.getItem("fh_plan");if(p)out.plan=p}catch(e){}
+ return out}
+let S;
+try{const raw=JSON.parse(localStorage.getItem(LS_KEY)||"null");
+ if(raw&&Array.isArray(raw.machines))S=raw;
+ else{S=migrateLegacy();if(S.machines.length)localStorage.setItem(LS_KEY,JSON.stringify(S))}}catch(e){S=migrateLegacy()}
+if(!Array.isArray(S.machines))S.machines=[];
+if(!Array.isArray(S.log))S.log=[];
+if(!S.totals||typeof S.totals!=="object")S.totals={};
+if(!S.plan)S.plan=480;
+S.machines=S.machines.filter(m=>m&&m.id&&m.code&&FACTORIES.includes(+m.factory)).map(m=>({id:m.id,code:m.code,type:m.type,factory:+m.factory,status:ST.includes(m.status)?m.status:"Idle",run:+m.run||0,idle:+m.idle||0,down:+m.down||0,perf:+m.perf||90,cycle:+m.cycle||CYC[m.code]||30}));
+if(!S.machines.length){
+ const g={};
+ S.log.forEach(l=>{if(l.a==="Opening stock")g[l.f+"|"+l.t]=true});
+ if(!Object.keys(g).length){S.log=[]}
+}
+const save=()=>{try{localStorage.setItem(LS_KEY,JSON.stringify(S))}catch(e){toast("Could not save: storage is full or blocked.",true)}};
+const st={v:null,f:1,inv:{f:"All",s:"All",q:""},ut:"All",msg:"",amsg:""};
+/* ===== Domain helpers ===== */
+function metrics(m){const r=rnd();
+ const down=m.status==="Breakdown"?2.5+r*3:r*.6;
+ const idle=m.status==="Idle"?2+r*2.5:rnd()*1.2;
+ m.down=+down.toFixed(1);m.idle=+idle.toFixed(1);m.run=+Math.max(0,8-m.down-m.idle).toFixed(1);
+ m.perf=Math.round(80+rnd()*18);m.cycle=Math.round((CYC[m.code]||30)*(.9+rnd()*.25));
+ return m}
+function seedFactory(){if(S.machines.length)return;for(let f=1;f<=5;f++){const n=14+f*2;
+ for(let i=1;i<=n;i++){const t=TYPES[Math.floor(rnd()*TYPES.length)];
+  const x=rnd(),status=x<.6?"Running":x<.78?"Idle":"Breakdown";
+  S.machines.push(metrics({id:"F"+f+"-"+t[1]+"-"+String(i).padStart(2,"0"),factory:f,type:t[0],code:t[1],status}))}}}
+seedFactory();
+if(!S.log.length){const g={};S.machines.forEach(m=>{const k=m.factory+"|"+m.type;g[k]=(g[k]||0)+1});Object.keys(g).forEach(k=>{const p=k.split("|");S.log.push({d:today(),f:+p[0],t:p[1],q:g[k],a:"Opening stock",n:""})})})
+const alloc=c=>S.machines.filter(m=>m.code===c).length;
+const P=()=>S.plan||480;
+const util=m=>Math.min(100,m.run*60/P()*100);
+const eff=m=>Math.round(util(m)*m.perf/100);
+const of=f=>S.machines.filter(m=>f==="All"||m.factory===+f);
+const cnt=(a,s)=>a.filter(m=>m.status===s).length;
+const pill=s=>`<span class="pill" style="background:${COL[s]}">${s}</span>`;
+const legend=()=>`<div class="leg">${ST.map(s=>`<span><i class="dot" style="background:${COL[s]}"></i>${s}</span>`).join("")}</div>`;
+const ftabs=(cur,key,all)=>`<div class="tabs" role="group" aria-label="Filter by factory">${(all?["All"]:[]).concat(FACTORIES).map(f=>`<button type="button" class="${String(f)===String(cur)?"on":""}" data-k="${key}" data-f="${escAttr(f)}" aria-pressed="${String(f)===String(cur)}">${f==="All"?"All factories":"Factory "+f}</button>`).join("")}</div>`;
+const facOpts=(sel,all)=>(all?`<option value="All"${String(sel)==="All"?" selected":""}>All factories</option>`:"")+FACTORIES.map(n=>`<option value="${n}"${String(sel)===String(n)?" selected":""}>Factory ${n}</option>`).join("");
+const typeOpts=sel=>TYPES.map(t=>`<option value="${t[1]}"${t[1]===sel?" selected":""}>${t[0]}</option>`).join("");
+const statusOpts=sel=>ST.map(x=>`<option${x===sel?" selected":""}>${x}</option>`).join("");
+const newId=(fac,c)=>{const nums=S.machines.filter(m=>m.factory===fac&&m.code===c).map(m=>+String(m.id).split("-")[2]).filter(x=>!isNaN(x));return "F"+fac+"-"+c+"-"+String((nums.length?Math.max(...nums):0)+1).padStart(2,"0")};
+const logAdd=(f,t,q,a,n)=>S.log.push({d:today(),f,t,q,a,n:n||""});
+
+/* ===== View: Factory Layouts ===== */
+function layouts(){const a=of(st.f);
+ let machineSvg=a.map((m,i)=>{const x=24+(i%13)*52,y=44+Math.floor(i/13)*46;
+  return `<g class="mt" data-id="${escAttr(m.id)}" tabindex="0" role="button" aria-label="${esc(m.id)} ${esc(m.type)}, ${m.status}"><rect x="${x}" y="${y}" width="46" height="34" rx="5" fill="${COL[m.status]}"/><text x="${x+23}" y="${y+21}" text-anchor="middle" class="mtl">${esc(m.code)}</text></g>`}).join("");
+ const svg=`<svg viewBox="0 0 720 440" width="100%" role="img" aria-label="Floor layout, Factory ${esc(st.f)}, ${a.length} machines"><rect x="2" y="2" width="716" height="436" rx="10" class="floor"/><rect x="14" y="14" width="692" height="390" rx="8" class="floor2"/><text x="22" y="32" class="mth">Sewing section · Factory ${esc(st.f)} · ${a.length} machines</text>${machineSvg}<rect x="300" y="426" width="120" height="10" rx="3" fill="var(--gold)"/><text x="360" y="422" text-anchor="middle">Entrance / Dispatch</text></svg>`;
+ app.innerHTML=`<h2>Factory Layouts</h2><p class="sub">Floor view of each factory’s sewing section. Tap a machine for details.</p>${ftabs(st.f,"f")}
+ <div class="card"><div class="grid">
+ <div class="kpi"><b>${a.length}</b><span>Machines</span></div><div class="kpi"><b>${cnt(a,"Running")}</b><span>Running</span></div>
+ <div class="kpi"><b>${cnt(a,"Idle")}</b><span>Available (idle)</span></div><div class="kpi"><b>${cnt(a,"Breakdown")}</b><span>Breakdown</span></div></div></div>
+ <div class="card">${legend()}${svg}<p class="leg" id="det">Tap a machine to see its details.</p></div>`;
+}
+function showMachine(id){const m=S.machines.find(x=>x.id===id);if(!m)return;
+ const dg=$("#machineDialog");
+ dg.innerHTML=`<h3>${esc(m.id)}</h3><dl class="det">
+ <dt>Type</dt><dd>${esc(m.type)}</dd><dt>Factory</dt><dd>Factory ${esc(m.factory)}</dd>
+ <dt>Status</dt><dd>${pill(m.status)}</dd><dt>Efficiency</dt><dd>${eff(m)}%</dd>
+ <dt>Cycle time</dt><dd>${esc(m.cycle)}s</dd><dt>Utilization</dt><dd>${util(m).toFixed(1)}%</dd></dl>
+ <div class="row" style="justify-content:flex-end;margin:0"><button class="btn" id="dlgClose" type="button">Close</button></div>`;
+ $("#dlgClose").onclick=()=>dg.close();
+ dg.showModal()}
+/* ===== View: Machine Inventory ===== */
+function inventory(){const{f,s}=st.inv;const q=st.inv.q.trim().toLowerCase();
+ const a=of(f).filter(m=>(s==="All"||m.status===s)&&m.id.toLowerCase().includes(q));
+ const msg=st.msg;st.msg="";const amsg=st.amsg;st.amsg="";
+ const tr=TYPES.map(t=>{const T=S.totals[t[1]]||0,al=alloc(t[1]),un=T-al;return `<tr><th scope="row">${esc(t[0])}</th><td><label class="sr" for="tin-${t[1]}">Total ${esc(t[0])} in stock</label><input type="number" min="0" id="tin-${t[1]}" class="tin" data-c="${t[1]}" value="${T}" style="width:90px"></td><td>${al}</td><td><b style="color:${un<0?"var(--down)":un===0?"var(--mut)":"var(--run)"}">${un}</b></td></tr>`}).join("");
+ const tsum=TYPES.reduce((x,t)=>x+(S.totals[t[1]]||0),0),asum=S.machines.length;
+ const lg=S.log.map((l,i)=>({l,i})).reverse().slice(0,40).map(o=>`<tr><td>${fmtDate(o.l.d)}</td><td>${o.l.f?"Factory "+esc(o.l.f):"Total stock"}</td><td>${esc(o.l.t)}</td><td>${esc(o.l.q)}</td><td>${esc(o.l.a)}</td><td>${esc(o.l.n)}</td><td><button class="btn lrm" data-i="${o.i}" type="button">Remove</button></td></tr>`).join("");
+ const sum=FACTORIES.map(n=>{const b=of(n);return `<tr><th scope="row">Factory ${n}</th><td>${b.length}</td><td>${cnt(b,"Idle")}</td><td>${cnt(b,"Running")}</td><td>${cnt(b,"Breakdown")}</td></tr>`}).join("");
+ const mx=TYPES.map(t=>`<tr><th scope="row">${esc(t[0])}</th>${FACTORIES.map(n=>`<td>${S.machines.filter(m=>m.factory===n&&m.code===t[1]).length}</td>`).join("")}<td><b>${S.machines.filter(m=>m.code===t[1]).length}</b></td></tr>`).join("");
+ app.innerHTML=`<h2>Machine Inventory</h2><p class="sub">Every machine and the factory it is assigned to. Transfer a machine by changing its factory.</p>
+ <div class="card"><h3>Available machines by factory</h3><div class="sc"><table><caption class="sr">Machines by factory and status</caption><thead><tr><th scope="col">Factory</th><th scope="col">Total</th><th scope="col">Available (idle)</th><th scope="col">Running</th><th scope="col">Breakdown</th></tr></thead><tbody>${sum}</tbody></table></div></div>
+ <div class="card"><h3>Machine stock by type</h3><div class="sc"><table><caption class="sr">Machine stock by type across factories</caption><thead><tr><th scope="col">Machine type</th>${FACTORIES.map(n=>`<th scope="col">F${n}</th>`).join("")}<th scope="col">Total</th></tr></thead><tbody>${mx}</tbody></table></div></div>
+ <div class="card"><h3>Total machines in stock (enter manually)</h3><p class="sub" style="margin-bottom:8px">Enter the total you own for each machine type, then allocate them to factories below. Unallocated = total in stock − allocated.</p><div class="sc"><table><caption class="sr">Totals in stock, allocated and unallocated by type</caption><thead><tr><th scope="col">Machine type</th><th scope="col">Total in stock</th><th scope="col">Allocated</th><th scope="col">Unallocated</th></tr></thead><tbody>${tr}<tr><th scope="row"><b>All machines</b></th><td><b>${tsum}</b></td><td><b>${asum}</b></td><td><b>${tsum-asum}</b></td></tr></tbody></table></div><div class="leg">A red unallocated number means more machines are allocated than your total, so update the total.</div></div>
+ <div class="card"><h3>Stock lookup</h3><div class="row"><label class="sr" for="lf">Lookup factory</label><select id="lf">${facOpts("All",true)}</select><label class="sr" for="lt">Lookup machine type</label><select id="lt">${typeOpts()}</select><button class="btn" id="lgo" type="button">Look up</button></div><p id="lr" style="font-size:15px;margin:6px 0 0" aria-live="polite"></p></div>
+ <div class="card"><h3>Allocate machines to a factory</h3><div class="row">
+ <label class="sr" for="nf">Factory to allocate to</label><select id="nf">${facOpts(1)}</select><label class="sr" for="nt">Machine type to allocate</label><select id="nt">${typeOpts()}</select>
+ <label class="sr" for="nq">Quantity to allocate</label><input id="nq" type="number" min="1" value="1" style="width:80px">
+ <label class="sr" for="nn">Note (optional)</label><input id="nn" placeholder="Note (optional)" maxlength="200">
+ <button class="btn pri" id="add" type="button">Allocate</button></div>${amsg?`<p class="leg" aria-live="polite">${amsg}</p>`:""}</div>
+ <div class="card"><h3>Return machines to unallocated stock</h3><div class="row">
+ <label class="sr" for="rf">Factory to return from</label><select id="rf">${facOpts("All"===st.inv.f?FACTORIES[0]:st.inv.f)}</select><label class="sr" for="rt">Machine type to return</label><select id="rt">${typeOpts()}</select>
+ <label class="sr" for="rq">Quantity to return</label><input id="rq" type="number" min="1" value="1" style="width:80px">
+ <button class="btn" id="rm" type="button">Return to stock</button></div>${msg?`<p class="leg" aria-live="polite">${msg}</p>`:""}</div>
+ <div class="card"><div class="row" style="justify-content:space-between"><h3 style="margin:0">Stock log (latest 40)</h3><button class="btn" id="lclr" type="button">Clear log</button></div><div class="sc"><table><caption class="sr">Allocation and return log, latest 40 entries</caption><thead><tr><th scope="col">Date</th><th scope="col">Factory</th><th scope="col">Machine</th><th scope="col">Qty</th><th scope="col">Action</th><th scope="col">Note</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody>${lg||`<tr><td colspan="7" style="color:var(--mut)">No log entries yet.</td></tr>`}</tbody></table></div></div>
+ <div class="card"><div class="row"><label class="sr" for="ff">Filter by factory</label><select id="ff"><option value="All"${f==="All"?" selected":""}>All factories</option>${facOpts(f)}</select>
+ <label class="sr" for="fs">Filter by status</label><select id="fs"><option value="All"${s==="All"?" selected":""}>All statuses</option>${ST.map(x=>`<option${x===s?" selected":""}>${x}</option>`).join("")}</select>
+ <label class="sr" for="sq">Search machine ID</label><input id="sq" placeholder="Search machine ID" value="${escAttr(st.inv.q)}">
+ <span class="leg" aria-live="polite">${a.length} shown</span></div>
+ <div class="sc"><table><caption class="sr">All machines with assignment and status</caption><thead><tr><th scope="col">ID</th><th scope="col">Type</th><th scope="col">Assigned to factory</th><th scope="col">Status</th><th scope="col"><span class="sr">Actions</span></th></tr></thead><tbody>
+ ${a.length?a.map(m=>`<tr><th scope="row">${esc(m.id)}</th><td>${esc(m.type)}</td><td><label class="sr" for="sf-${escAttr(m.id)}">Factory for ${esc(m.id)}</label><select data-id="${escAttr(m.id)}" id="sf-${escAttr(m.id)}" class="sfac">${facOpts(m.factory)}</select></td><td><label class="sr" for="ss-${escAttr(m.id)}">Status for ${esc(m.id)}</label><select data-id="${escAttr(m.id)}" id="ss-${escAttr(m.id)}" class="sset">${statusOpts(m.status)}</select></td><td><button class="btn del" data-id="${escAttr(m.id)}" type="button">Return to stock</button></td></tr>`).join(""):`<tr><td colspan="5" style="color:var(--mut)">No machines match the current filters.</td></tr>`}</tbody></table></div></div>`;
+ doLookup();
+}
+function doLookup(){const el=$("#lr");if(!el)return;const f=$("#lf").value,c=$("#lt").value,t=TYPES.find(x=>x[1]===c);if(!t){el.textContent="";return}
+ const b=S.machines.filter(m=>m.code===c&&(f==="All"||m.factory===+f));
+ el.innerHTML=`<b>${f==="All"?"All factories":"Factory "+esc(f)} · ${esc(t[0])}</b>: ${b.length} machine${b.length===1?"":"s"} in stock — ${cnt(b,"Idle")} available, ${cnt(b,"Running")} running, ${cnt(b,"Breakdown")} breakdown · total owned ${S.totals[c]||0}, unallocated ${(S.totals[c]||0)-alloc(c)}`}
+
+/* ===== View: Machine Utilization ===== */
+function utilization(){const a=of(st.ut),Pm=P(),n=a.length;
+ const runMin=a.reduce((x,m)=>x+Math.min(m.run*60,Pm),0),plan=n*Pm,U=plan?runMin/plan*100:0,ph=Pm/60;
+ const avgE=n?Math.round(a.reduce((x,m)=>x+eff(m),0)/n):0;
+ const grade=u=>u>=85?["World-class (85%+)","var(--run)"]:u>=70?["Smooth operations (70%+)","var(--run)"]:u>30?["Above industry average, below 70% target","var(--idle)"]:u<1&&n===0?["","var(--mut)"]:["Industry-average range (26-30%) or lower","var(--down)"];
+ const g=grade(U),out=a.reduce((x,m)=>x+Math.round(m.run*3600/m.cycle*m.perf/100),0);
+ const pc=k=>plan?Math.round(a.reduce((x,m)=>x+m[k],0)*60/plan*100):0;
+ const rows=FACTORIES.map(f=>{const b=of(f),r=b.reduce((x,m)=>x+m.run,0),i=b.reduce((x,m)=>x+m.idle,0),d=b.reduce((x,m)=>x+m.down,0),t=Math.max(b.length*ph,r+i+d)||1;
+  const u=b.length?b.reduce((x,m)=>x+util(m),0)/b.length:0;
+  return `<div style="margin-bottom:12px"><div class="row" style="margin:0 0 4px;justify-content:space-between"><b>Factory ${f}</b><span class="leg" style="margin:0">Utilization ${u.toFixed(1)}% · ${b.length} machines</span></div>
+  <div class="bar" role="img" aria-label="Factory ${f}: run ${Math.round(r/t*100)}%, idle ${Math.round(i/t*100)}%, breakdown ${Math.round(d/t*100)}%"><i style="width:${r/t*100}%;background:var(--run)"></i><i style="width:${i/t*100}%;background:var(--idle)"></i><i style="width:${d/t*100}%;background:var(--down)"></i></div></div>`}).join("");
+ const top=a.slice().sort((x,y)=>util(y)-util(x));
+ const col=u=>u>=70?"var(--run)":u>30?"var(--idle)":"var(--down)";
+ app.innerHTML=`<h2>Machine Utilization</h2><p class="sub">How much of the planned production time each machine is actually running.</p>${ftabs(st.ut,"u",true)}
+ <div class="card"><div class="row"><label for="pp"><b>Planned production time per machine (minutes)</b></label><input id="pp" type="number" min="60" max="1440" value="${Pm}" style="width:90px"></div>
+ <div class="leg" style="margin-top:0">Shift minutes excluding planned breaks and routine scheduled maintenance. Default 480 (8-hour shift).</div></div>
+ <div class="card"><div class="grid">
+ <div class="kpi"><b style="color:${g[1]}">${U.toFixed(1)}%</b><span>Machine utilization</span></div>
+ <div class="kpi"><b>${avgE}%</b><span>Avg efficiency</span></div>
+ <div class="kpi"><b>${pc("idle")}%</b><span>Idle time</span></div>
+ <div class="kpi"><b>${pc("down")}%</b><span>Breakdown time</span></div>
+ <div class="kpi"><b>${out.toLocaleString()}</b><span>Est. output / shift</span></div></div>
+ <div class="leg">${n?`<b style="color:${g[1]}">${g[0]}</b>`:"Add machines on the Inventory page to see utilization."} · Efficiency = utilization × performance rate. Run, idle and breakdown times are simulated until real shift data is entered.</div></div>
+ <div class="card"><h3>How utilization is calculated</h3>
+ <div style="font-size:16px;font-weight:600;margin-bottom:8px">Utilization (%) = (Actual running time ÷ Planned production time) × 100</div>
+ <div class="leg"><span><b>Actual running time:</b> minutes a machine is actively working, not just powered on.</span></div>
+ <div class="leg"><span><b>Planned production time:</b> scheduled shift minutes, excluding planned breaks and routine scheduled maintenance.</span></div>
+ <div class="leg" style="color:var(--tx)">${n?`Current selection: ${Math.round(runMin).toLocaleString()} min running ÷ ${plan.toLocaleString()} min planned × 100 = <b>${U.toFixed(1)}%</b>`:"No machines yet."}</div>
+ <div class="leg">Example: 480-minute shift, 80 minutes lost to repairs and changeovers, 400 minutes running → 400 ÷ 480 × 100 = 83.3%.</div>
+ <div class="leg"><span><i class="dot" style="background:var(--run)"></i>85%+ world-class</span><span><i class="dot" style="background:var(--run)"></i>70%+ smooth operations</span><span><i class="dot" style="background:var(--idle)"></i>26-30% typical discrete manufacturing average</span></div></div>
+ <div class="card"><h3>Time split per factory (planned shift)</h3><div class="leg"><span><i class="dot" style="background:var(--run)"></i>Run</span><span><i class="dot" style="background:var(--idle)"></i>Idle</span><span><i class="dot" style="background:var(--down)"></i>Breakdown</span></div>${rows}</div>
+ <div class="card"><h3>Machines ranked by utilization</h3><div class="sc"><table><caption class="sr">Machines ranked by utilization</caption><thead><tr><th scope="col">ID</th><th scope="col">Type</th><th scope="col">Status</th><th scope="col">Run (min)</th><th scope="col">Idle (min)</th><th scope="col">Breakdown (min)</th><th scope="col">Utilization %</th><th scope="col">Eff %</th></tr></thead><tbody>
+ ${top.length?top.map(m=>`<tr><th scope="row">${esc(m.id)}</th><td>${esc(m.type)}</td><td>${pill(m.status)}</td><td>${Math.round(m.run*60)}</td><td>${Math.round(m.idle*60)}</td><td>${Math.round(m.down*60)}</td><td><b>${util(m).toFixed(1)}</b><span class="eff"><i style="width:${util(m)}%;background:${col(util(m))}"></i></span></td><td>${eff(m)}</td></tr>`).join(""):`<tr><td colspan="8" style="color:var(--mut)">No machines in this selection.</td></tr>`}</tbody></table></div></div>`}
+/* ===== Hero & routing ===== */
+function hero(){const t=S.machines.length,e=t?Math.round(S.machines.reduce((x,m)=>x+eff(m),0)/t):0;
+ $("#hero").innerHTML=`<h1>Automation Hub</h1><p>Sewing section · 5 factories · inventory and utilization at a glance · Updated ${new Date().toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}</p><div class="hk"><div><b>${t}</b><span>Total machines</span></div><div><b>${cnt(S.machines,"Idle")}</b><span>Available</span></div><div><b>${cnt(S.machines,"Running")}</b><span>Running</span></div><div><b>${e}%</b><span>Avg efficiency</span></div></div>`}
+function route(){hero();const v=st.v||(location.hash||"#layouts").slice(1);const view={layouts,inventory,utilization}[v]?v:"layouts";
+ document.querySelectorAll("nav a").forEach(a=>{a.classList.toggle("on",a.dataset.v===view);a.setAttribute("aria-current",a.dataset.v===view?"page":"false")});
+ ({layouts,inventory,utilization})[view]()}
+/* ===== Delegated events (bound once) ===== */
+app.addEventListener("click",async e=>{
+ const mt=e.target.closest(".mt");if(mt){showMachine(mt.dataset.id);return}
+ const b=e.target.closest("button[data-k]");if(b){if(b.dataset.k==="f")st.f=+b.dataset.f;else st.ut=b.dataset.f;route();return}
+ if(e.target.closest("#lclr")){if(await confirmDialog("Clear the entire stock log? This cannot be undone.")){S.log=[];save();toast("Stock log cleared.");inventory()}return}
+ const del=e.target.closest(".del");if(del){const m=S.machines.find(x=>x.id===del.dataset.id);
+  if(m){if(await confirmDialog("Return machine "+m.id+" to unallocated stock?")){logAdd(m.factory,m.type,1,"Returned to stock",m.id);S.machines=S.machines.filter(x=>x.id!==del.dataset.id);save();toast("Machine "+m.id+" returned to stock.");inventory()}}return}
+ const lrm=e.target.closest(".lrm");if(lrm){const i=+lrm.dataset.i;if(S.log[i]){if(await confirmDialog("Remove this log entry?")){S.log.splice(i,1);save();inventory()}}return}
+ if(e.target.closest("#lgo")){doLookup();return}
+ if(e.target.closest("#add")){const fac=+$("#nf").value,c=$("#nt").value,t=TYPES.find(x=>x[1]===c),q=Math.max(1,Math.min(200,parseInt($("#nq").value)||1));
+  const free=(S.totals[c]||0)-alloc(c);
+  if(q>free){st.amsg=free>0?"Only "+free+" "+t[0]+" unallocated. Enter "+free+" or fewer, or raise the total in stock.":"No unallocated "+t[0]+". Raise the total in stock first.";inventory();return}
+  for(let k=0;k<q;k++)S.machines.push(metrics({id:newId(fac,c),factory:fac,type:t[0],code:c,status:"Idle"}));
+  logAdd(fac,t[0],q,"Allocated",($("#nn").value||"").trim());save();st.inv.f=fac;toast("Allocated "+q+" "+t[0]+" to Factory "+fac+".");inventory();return}
+ if(e.target.closest("#rm")){const f=+$("#rf").value,c=$("#rt").value,t=TYPES.find(x=>x[1]===c),q=Math.max(1,parseInt($("#rq").value)||1);
+  const rank={Idle:0,Breakdown:1,Running:2},pool=S.machines.filter(m=>m.factory===f&&m.code===c).sort((x,y)=>rank[x.status]-rank[y.status]).slice(0,q);
+  if(!pool.length){st.msg="No "+t[0]+" machines in Factory "+f+" to remove."}
+  else{const ids=pool.map(m=>m.id);S.machines=S.machines.filter(m=>!ids.includes(m.id));logAdd(f,t[0],pool.length,"Returned to stock",ids.join(", "));save();toast("Returned "+pool.length+" "+t[0]+" from Factory "+f+" to unallocated stock"+(pool.length<q?" (only "+pool.length+" in stock)":"")+".")}
+  inventory();return}
+});
+app.addEventListener("change",e=>{const el=e.target;
+ if(el.classList.contains("tin")){const c=el.dataset.c,old=S.totals[c]||0,v=Math.max(0,Math.floor(+el.value||0));
+  if(v!==old){const t=TYPES.find(x=>x[1]===c);S.totals[c]=v;logAdd(0,t[0],v,"Total stock set","was "+old);save();toast("Total "+t[0]+" in stock set to "+v+".")}inventory();return}
+ if(el.classList.contains("sset")){const m=S.machines.find(x=>x.id===el.dataset.id);if(m){m.status=el.value;save();toast(m.id+" status set to "+m.status+".")}return}
+ if(el.classList.contains("sfac")){const m=S.machines.find(x=>x.id===el.dataset.id);
+  if(m){const o=m.factory,oid=m.id;m.factory=+el.value;m.id=newId(m.factory,m.code);logAdd(m.factory,m.type,1,"Transferred from Factory "+o,oid+" > "+m.id);save();toast(oid+" transferred to Factory "+m.factory+" as "+m.id+".")}inventory();return}
+ if(el.id==="ff"){st.inv.f=el.value;inventory();return}
+ if(el.id==="fs"){st.inv.s=el.value;inventory();return}
+ if(el.id==="lf"||el.id==="lt"){doLookup();return}
+ if(el.id==="pp"){S.plan=Math.max(60,Math.min(1440,parseInt(el.value)||480));save();utilization();return}
+});
+app.addEventListener("keydown",e=>{const mt=e.target.closest(".mt");if(mt&&(e.key==="Enter"||e.key===" ")){e.preventDefault();showMachine(mt.dataset.id)}});
+app.addEventListener("input",e=>{if(e.target.id==="sq"){st.inv.q=e.target.value;const q=st.inv.q.trim().toLowerCase();const{f,s}=st.inv;const a=of(f).filter(m=>(s==="All"||m.status===s)&&m.id.toLowerCase().includes(q));const span=e.target.parentElement.querySelector(".leg");if(span)span.textContent=a.length+" shown";const tb=app.querySelector("table:last-of-type tbody");if(tb)tb.innerHTML=a.length?a.map(m=>`<tr><th scope="row">${esc(m.id)}</th><td>${esc(m.type)}</td><td><label class="sr" for="sf-${escAttr(m.id)}">Factory for ${esc(m.id)}</label><select data-id="${escAttr(m.id)}" id="sf-${escAttr(m.id)}" class="sfac">${facOpts(m.factory)}</select></td><td><label class="sr" for="ss-${escAttr(m.id)}">Status for ${esc(m.id)}</label><select data-id="${escAttr(m.id)}" id="ss-${escAttr(m.id)}" class="sset">${statusOpts(m.status)}</select></td><td><button class="btn del" data-id="${escAttr(m.id)}" type="button">Return to stock</button></td></tr>`).join(""):`<tr><td colspan="5" style="color:var(--mut)">No machines match the current filters.</td></tr>`}});
+app.addEventListener("keydown",e=>{if((e.target.id==="sq"||e.target.id==="nn")&&e.key==="Enter"){e.target.dispatchEvent(new Event("change",{bubbles:true}))}});
+document.querySelectorAll("nav a").forEach(a=>a.addEventListener("click",e=>{e.preventDefault();st.v=a.dataset.v;try{history.replaceState(null,"","#"+a.dataset.v)}catch(x){}route();window.scrollTo(0,0);app.focus({preventScroll:true})}));
+addEventListener("hashchange",()=>{st.v=null;route()});
+/* ===== Theme ===== */
+const themeBtn=$("#themeBtn");
+function applyTheme(t){document.documentElement.dataset.theme=t;try{localStorage.setItem("automationHub.theme",t)}catch(e){}themeBtn.textContent=t==="dark"?"☀":"◐"}
+let savedTheme=null;try{savedTheme=localStorage.getItem("automationHub.theme")}catch(e){}
+if(savedTheme)applyTheme(savedTheme);
+themeBtn.addEventListener("click",()=>{const cur=document.documentElement.dataset.theme||(matchMedia("(prefers-color-scheme:dark)").matches?"dark":"light");applyTheme(cur==="dark"?"light":"dark")});
+/* ===== Export / Import ===== */
+$("#exportBtn").addEventListener("click",()=>{const blob=new Blob([JSON.stringify({exported:new Date().toISOString(),...S},null,2)],{type:"application/json"});
+ const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="automation-hub-data-"+today()+".json";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000);toast("Data exported.")});
+$("#importBtn").addEventListener("click",()=>$("#importFile").click());
+$("#importFile").addEventListener("change",e=>{const file=e.target.files&&e.target.files[0];if(!file)return;const fr=new FileReader();
+ fr.onload=async()=>{try{const d=JSON.parse(String(fr.result));if(!d||!Array.isArray(d.machines))throw 0;
+  if(await confirmDialog("Replace all current data with the imported file?")){S.machines=d.machines;S.log=Array.isArray(d.log)?d.log:[];S.totals=d.totals&&typeof d.totals==="object"?d.totals:{};S.plan=+d.plan||480;save();route();toast("Data imported successfully.")}}catch(x){toast("Import failed: not a valid Automation Hub export.",true)}
+  e.target.value=""};
+ fr.onerror=()=>{toast("Could not read that file.",true);e.target.value=""};fr.readAsText(file)});
+/* ===== Init ===== */
+route();
+</script>
+</body>
+</html>
